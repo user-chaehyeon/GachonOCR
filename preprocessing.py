@@ -66,6 +66,28 @@ def draw_quad_on_image(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
 
     return visual
 
+
+def draw_split_on_image(
+    image: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    split_x: int | None,
+    page_bboxes: list[tuple[int, int, int, int]] | None = None,
+) -> np.ndarray:
+    visual = draw_bbox_on_image(image, bbox)
+    x1, y1, _, y2 = bbox
+
+    if split_x is not None:
+        absolute_x = x1 + split_x
+        cv2.line(visual, (absolute_x, y1), (absolute_x, y2), (0, 255, 255), 4)
+
+    if page_bboxes is not None:
+        colors = ((255, 0, 0), (0, 128, 255))
+        for index, page_bbox in enumerate(page_bboxes):
+            px1, py1, px2, py2 = page_bbox
+            cv2.rectangle(visual, (px1, py1), (px2, py2), colors[index % len(colors)], 3)
+
+    return visual
+
 # --------------------------------------------------------------------------
 # 이미지 크기 리사이즈 / 축소: INTER_AREA, 확대: INTER_CUBIC
 def resize_for_ocr(image: np.ndarray, target_long_side: int = 3200) -> np.ndarray:
@@ -802,6 +824,135 @@ def trim_dark_outer_borders(image: np.ndarray, bbox: tuple[int, int, int, int]) 
     return x1 + left, y1 + top, x1 + right, y1 + bottom
 
 
+def _smooth_projection(values: np.ndarray, window: int) -> np.ndarray:
+    window = max(3, int(window))
+    if window % 2 == 0:
+        window += 1
+    kernel = np.ones(window, dtype="float32") / float(window)
+    return np.convolve(values.astype("float32"), kernel, mode="same")
+
+
+def _normalize_projection(values: np.ndarray) -> np.ndarray:
+    low, high = np.percentile(values, [5, 95])
+    if high - low < 1e-6:
+        return np.zeros_like(values, dtype="float32")
+    return np.clip((values - low) / (high - low), 0.0, 1.0).astype("float32")
+
+
+def find_book_spine_x(crop: np.ndarray) -> int | None:
+    """Find the center gutter/spine x-coordinate inside an already-cropped book spread."""
+    height, width = crop.shape[:2]
+    if width < 360 or height < 360:
+        return None
+    if width / float(max(1, height)) < 1.08:
+        return None
+
+    target_height = 900
+    if height > target_height:
+        scale = target_height / float(height)
+        small_width = max(1, int(round(width * scale)))
+        small = cv2.resize(crop, (small_width, target_height), interpolation=cv2.INTER_AREA)
+    else:
+        scale = 1.0
+        small = crop.copy()
+
+    small_height, small_width = small.shape[:2]
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(
+        gray,
+        (0, 0),
+        sigmaX=max(2.0, small_width / 260.0),
+        sigmaY=max(2.0, small_height / 220.0),
+    )
+
+    y1 = int(small_height * 0.04)
+    y2 = int(small_height * 0.96)
+    text_mask = build_text_candidate_mask(small)
+
+    brightness = np.mean(gray[y1:y2, :], axis=0)
+    dark_projection = 255.0 - brightness
+    sobel_x = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    edge_projection = np.mean(sobel_x[y1:y2, :], axis=0)
+    text_projection = np.mean(text_mask[y1:y2, :] > 0, axis=0)
+
+    smooth_width = max(9, small_width // 90)
+    dark_projection = _smooth_projection(dark_projection, smooth_width)
+    edge_projection = _smooth_projection(edge_projection, smooth_width)
+    text_projection = _smooth_projection(text_projection, smooth_width)
+
+    dark_score = _normalize_projection(dark_projection)
+    edge_score = _normalize_projection(edge_projection)
+    text_penalty = _normalize_projection(text_projection)
+    x_positions = np.arange(small_width, dtype="float32")
+    center_x = (small_width - 1) / 2.0
+    center_score = 1.0 - np.clip(np.abs(x_positions - center_x) / max(1.0, small_width * 0.22), 0.0, 1.0)
+
+    score = dark_score * 0.50 + edge_score * 0.22 + center_score * 0.35 - text_penalty * 0.28
+    search_left = int(small_width * 0.38)
+    search_right = int(small_width * 0.62)
+    if search_right <= search_left:
+        return None
+
+    best_index = int(search_left + np.argmax(score[search_left:search_right]))
+    best_score = float(score[best_index])
+    band_median = float(np.median(score[search_left:search_right]))
+    spine_evidence = float(dark_score[best_index] + edge_score[best_index])
+    text_density = float(np.mean(text_mask > 0))
+
+    if text_density < 0.001:
+        return None
+    if best_score < 0.42 or best_score < band_median + 0.10:
+        return None
+    if spine_evidence < 0.55:
+        return None
+
+    return int(round(best_index / scale))
+
+
+def split_book_bbox_by_spine(
+    image: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> tuple[list[tuple[int, int, int, int]], int | None]:
+    bbox = trim_dark_outer_borders(image, bbox)
+    x1, y1, x2, y2 = bbox
+    crop = image[y1:y2, x1:x2]
+    split_x = find_book_spine_x(crop)
+    if split_x is None:
+        return [trim_opposite_page_sliver(image, bbox)], None
+
+    width = x2 - x1
+    gutter_padding = max(2, int(width * 0.004))
+    left_bbox = clamp_bbox((x1, y1, x1 + split_x - gutter_padding, y2), image)
+    right_bbox = clamp_bbox((x1 + split_x + gutter_padding, y1, x2, y2), image)
+    if left_bbox is None or right_bbox is None:
+        return [trim_opposite_page_sliver(image, bbox)], None
+
+    left_width = left_bbox[2] - left_bbox[0]
+    right_width = right_bbox[2] - right_bbox[0]
+    if min(left_width, right_width) < width * 0.28:
+        return [trim_opposite_page_sliver(image, bbox)], None
+
+    page_bboxes = []
+    for page_bbox in (left_bbox, right_bbox):
+        trimmed = trim_dark_outer_borders(image, page_bbox)
+        clamped = clamp_bbox(trimmed, image)
+        if clamped is not None:
+            page_bboxes.append(clamped)
+
+    if len(page_bboxes) != 2:
+        return [trim_opposite_page_sliver(image, bbox)], None
+
+    return page_bboxes, split_x
+
+
+def find_book_page_bboxes(image: np.ndarray) -> list[tuple[int, int, int, int]] | None:
+    crop_bbox = find_best_dynamic_crop_bbox(image)
+    if crop_bbox is None:
+        return None
+    page_bboxes, _ = split_book_bbox_by_spine(image, crop_bbox)
+    return page_bboxes
+
+
 def safe_crop_page_by_brightness(image: np.ndarray) -> np.ndarray:
     crop_bbox = find_best_dynamic_crop_bbox(image)
     if crop_bbox is None:
@@ -828,6 +979,52 @@ def crop_document_or_book(image: np.ndarray, enabled: bool = True, mode: str = "
     if warped.shape[0] < 80 or warped.shape[1] < 80:
         return safe_crop_page_by_brightness(image)
     return warped
+
+
+def crop_document_or_book_pages(
+    image: np.ndarray,
+    enabled: bool = True,
+    mode: str = "safe",
+    split_pages: bool = True,
+) -> list[np.ndarray]:
+    if not enabled:
+        return [image]
+
+    if mode == "safe":
+        crop_bbox = find_best_dynamic_crop_bbox(image)
+        if crop_bbox is None:
+            return [image]
+
+        if split_pages:
+            page_bboxes, _ = split_book_bbox_by_spine(image, crop_bbox)
+            return [image[y1:y2, x1:x2] for x1, y1, x2, y2 in page_bboxes]
+
+        crop_bbox = trim_dark_outer_borders(image, crop_bbox)
+        crop_bbox = trim_opposite_page_sliver(image, crop_bbox)
+        x1, y1, x2, y2 = crop_bbox
+        return [image[y1:y2, x1:x2]]
+
+    quad = find_document_or_book_quad(image)
+    if quad is None:
+        return crop_document_or_book_pages(image, enabled=True, mode="safe", split_pages=split_pages)
+
+    warped = four_point_transform(image, quad)
+    if warped.shape[0] < 80 or warped.shape[1] < 80:
+        return crop_document_or_book_pages(image, enabled=True, mode="safe", split_pages=split_pages)
+
+    if not split_pages:
+        return [warped]
+
+    split_x = find_book_spine_x(warped)
+    if split_x is None:
+        return [warped]
+
+    gutter_padding = max(2, int(warped.shape[1] * 0.004))
+    left = warped[:, : max(1, split_x - gutter_padding)]
+    right = warped[:, min(warped.shape[1] - 1, split_x + gutter_padding) :]
+    if left.shape[1] < warped.shape[1] * 0.28 or right.shape[1] < warped.shape[1] * 0.28:
+        return [warped]
+    return [left, right]
 
 # --------------------------------------------------------------------------
 # binary 반전 → 글자 픽셀 좌표 추출 → cv2.minAreaRect로 전체 텍스트 덩어리 각도 추정 → ±10도 이내면 회전 보정
@@ -928,70 +1125,18 @@ def deskew_text_lines(binary_image: np.ndarray) -> np.ndarray:
 #     return deskew_text_lines(binary)
 
 
-def preprocess_for_tesseract(
+def _prepare_page_for_tesseract(
     image: np.ndarray,
-    crop_document: bool = True,
-    crop_mode: str = "safe",
     save_stages: bool = False,
     stage_output_dir: Path | None = None,
 ) -> np.ndarray:
-
-    if save_stages:
-        if stage_output_dir is None:
-            stage_output_dir = Path("preprocess_stages")
+    if save_stages and stage_output_dir is not None:
         stage_output_dir.mkdir(parents=True, exist_ok=True)
-        save_stage_image(stage_output_dir, 1, "input", image)
-
-    image = resize_for_ocr(image)
-    if save_stages:
-        save_stage_image(stage_output_dir, 2, "resized", image)
-
-    # image = crop_document_or_book(image, enabled=crop_document, mode=crop_mode)
-    # if save_stages:
-    #     save_stage_image(stage_output_dir, 3, "cropped", image)
-    
-    if crop_document:
-        if crop_mode == "safe":
-            crop_bbox = find_best_dynamic_crop_bbox(image)
-
-            if crop_bbox is not None:
-                if save_stages:
-                    visual = draw_bbox_on_image(image, crop_bbox)
-                    save_stage_image(stage_output_dir, 3, "detected_bbox", visual)
-
-                crop_bbox = trim_dark_outer_borders(image, crop_bbox)
-                crop_bbox = trim_opposite_page_sliver(image, crop_bbox)
-
-                if save_stages:
-                    visual = draw_bbox_on_image(image, crop_bbox)
-                    save_stage_image(stage_output_dir, 4, "final_crop_bbox", visual)
-
-                x1, y1, x2, y2 = crop_bbox
-                image = image[y1:y2, x1:x2]
-
-            else:
-                if save_stages:
-                    save_stage_image(stage_output_dir, 3, "detected_bbox_failed", image)
-
-        else:
-            quad = find_document_or_book_quad(image)
-
-            if quad is not None:
-                if save_stages:
-                    visual = draw_quad_on_image(image, quad)
-                    save_stage_image(stage_output_dir, 3, "detected_quad", visual)
-
-                image = four_point_transform(image, quad)
-
-            else:
-                image = safe_crop_page_by_brightness(image)
-
-    if save_stages:
-        save_stage_image(stage_output_dir, 5, "cropped", image)
+        save_stage_image(stage_output_dir, 1, "page_input", image)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if save_stages:
-        save_stage_image(stage_output_dir, 4, "grayscale", gray)
+    if save_stages and stage_output_dir is not None:
+        save_stage_image(stage_output_dir, 2, "grayscale", gray)
 
     gray = cv2.fastNlMeansDenoising(
         gray,
@@ -1000,13 +1145,8 @@ def preprocess_for_tesseract(
         templateWindowSize=7,
         searchWindowSize=21,
     )
-    if save_stages:
-        save_stage_image(stage_output_dir, 5, "denoised", gray)
-
-    # clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    # gray = clahe.apply(gray)
-    # if save_stages:
-    #     save_stage_image(stage_output_dir, 6, "clahe", gray)
+    if save_stages and stage_output_dir is not None:
+        save_stage_image(stage_output_dir, 3, "denoised", gray)
 
     binary = cv2.adaptiveThreshold(
         gray,
@@ -1016,20 +1156,112 @@ def preprocess_for_tesseract(
         35,
         11,
     )
-    if save_stages:
-        save_stage_image(stage_output_dir, 7, "binary", binary)
-
-    # binary = cv2.morphologyEx(
-    #     binary,
-    #     cv2.MORPH_OPEN,
-    #     np.ones((2, 2), np.uint8),
-    #     iterations=1,
-    # )
-    # if save_stages:
-    #     save_stage_image(stage_output_dir, 8, "morph_open", binary)
+    if save_stages and stage_output_dir is not None:
+        save_stage_image(stage_output_dir, 4, "binary", binary)
 
     deskewed = deskew_text_lines(binary)
-    if save_stages:
-        save_stage_image(stage_output_dir, 9, "deskewed", deskewed)
+    if save_stages and stage_output_dir is not None:
+        save_stage_image(stage_output_dir, 5, "deskewed", deskewed)
 
-    return deskew_text_lines(binary)
+    return deskewed
+
+
+def preprocess_pages_for_tesseract(
+    image: np.ndarray,
+    crop_document: bool = True,
+    crop_mode: str = "safe",
+    split_pages: bool = True,
+    save_stages: bool = False,
+    stage_output_dir: Path | None = None,
+) -> list[np.ndarray]:
+    if save_stages:
+        if stage_output_dir is None:
+            stage_output_dir = Path("preprocess_stages")
+        stage_output_dir.mkdir(parents=True, exist_ok=True)
+        save_stage_image(stage_output_dir, 1, "input", image)
+
+    image = resize_for_ocr(image)
+    if save_stages and stage_output_dir is not None:
+        save_stage_image(stage_output_dir, 2, "resized", image)
+
+    page_images = [image]
+    if crop_document:
+        if crop_mode == "safe":
+            crop_bbox = find_best_dynamic_crop_bbox(image)
+
+            if crop_bbox is not None:
+                if save_stages and stage_output_dir is not None:
+                    visual = draw_bbox_on_image(image, crop_bbox)
+                    save_stage_image(stage_output_dir, 3, "detected_bbox", visual)
+
+                if split_pages:
+                    final_bbox = trim_dark_outer_borders(image, crop_bbox)
+                    page_bboxes, split_x = split_book_bbox_by_spine(image, crop_bbox)
+
+                    if save_stages and stage_output_dir is not None:
+                        visual = draw_split_on_image(image, final_bbox, split_x, page_bboxes)
+                        save_stage_image(stage_output_dir, 4, "page_split_bboxes", visual)
+
+                    page_images = [image[y1:y2, x1:x2] for x1, y1, x2, y2 in page_bboxes]
+                else:
+                    crop_bbox = trim_dark_outer_borders(image, crop_bbox)
+                    crop_bbox = trim_opposite_page_sliver(image, crop_bbox)
+
+                    if save_stages and stage_output_dir is not None:
+                        visual = draw_bbox_on_image(image, crop_bbox)
+                        save_stage_image(stage_output_dir, 4, "final_crop_bbox", visual)
+
+                    x1, y1, x2, y2 = crop_bbox
+                    page_images = [image[y1:y2, x1:x2]]
+
+            elif save_stages and stage_output_dir is not None:
+                save_stage_image(stage_output_dir, 3, "detected_bbox_failed", image)
+
+        else:
+            page_images = crop_document_or_book_pages(
+                image,
+                enabled=True,
+                mode=crop_mode,
+                split_pages=split_pages,
+            )
+
+    if save_stages and stage_output_dir is not None:
+        for index, page_image in enumerate(page_images, start=1):
+            suffix = "cropped" if len(page_images) == 1 else f"cropped_page_{index:02d}"
+            save_stage_image(stage_output_dir, 5 + index - 1, suffix, page_image)
+
+    processed_pages = []
+    for index, page_image in enumerate(page_images, start=1):
+        page_stage_dir = None
+        if save_stages and stage_output_dir is not None:
+            if len(page_images) == 1:
+                page_stage_dir = stage_output_dir / "page"
+            else:
+                page_stage_dir = stage_output_dir / f"page_{index:02d}"
+        processed_pages.append(
+            _prepare_page_for_tesseract(
+                page_image,
+                save_stages=save_stages,
+                stage_output_dir=page_stage_dir,
+            )
+        )
+
+    return processed_pages
+
+
+def preprocess_for_tesseract(
+    image: np.ndarray,
+    crop_document: bool = True,
+    crop_mode: str = "safe",
+    save_stages: bool = False,
+    stage_output_dir: Path | None = None,
+) -> np.ndarray:
+    pages = preprocess_pages_for_tesseract(
+        image,
+        crop_document=crop_document,
+        crop_mode=crop_mode,
+        split_pages=False,
+        save_stages=save_stages,
+        stage_output_dir=stage_output_dir,
+    )
+    return pages[0]
